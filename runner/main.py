@@ -24,6 +24,7 @@ Config file (YAML):
 """
 import argparse
 import asyncio
+import fcntl
 import logging
 import os
 import signal
@@ -45,6 +46,7 @@ logging.basicConfig(
 log = logging.getLogger("runner.main")
 
 _shutdown = False
+_instance_lock_fd = None
 
 
 def _handle_signal(signum, frame):
@@ -77,6 +79,24 @@ def load_config(path: str) -> dict:
             raise ValueError(f"Config missing required field: {required}")
 
     return cfg
+
+
+def _acquire_instance_lock(server_name: str) -> None:
+    """Ensure only one runner instance is active per server_name on this host."""
+    global _instance_lock_fd
+    safe_name = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in server_name)
+    lock_path = f"/tmp/agent-lab-runner-{safe_name}.lock"
+    fd = open(lock_path, "w")
+    try:
+        fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fd.close()
+        raise RuntimeError(
+            f"Another runner instance is already running for server_name={server_name}"
+        )
+    fd.write(f"{os.getpid()}\n")
+    fd.flush()
+    _instance_lock_fd = fd
 
 
 def _get_gpu_info() -> dict:
@@ -177,6 +197,7 @@ async def main(config_path: str):
         f"Remote Runner starting: server={server_name} lab={lab_url} "
         f"max_concurrent={max_concurrent}"
     )
+    _acquire_instance_lock(server_name)
 
     state_store = StateStore(db_path=state_db)
 
@@ -237,6 +258,31 @@ async def main(config_path: str):
                             free_slots=free_slots,
                             capabilities={"gpu_info": gpu_info, "max_concurrent": max_concurrent},
                         )
+                        if len(claimed) > free_slots:
+                            log.error(
+                                "Lab returned %d claimed job(s) with only %d free slot(s); "
+                                "processing only the first %d",
+                                len(claimed), free_slots, free_slots,
+                            )
+                            overflow = claimed[free_slots:]
+                            claimed = claimed[:free_slots]
+                            for job in overflow:
+                                try:
+                                    await client.job_fail(
+                                        queue_id=job["queue_id"],
+                                        lease_token=job["lease_token"],
+                                        error_code="RUNNER_CAPACITY_EXCEEDED",
+                                        message=(
+                                            "Runner received more jobs than available slots; "
+                                            "returning overflow job to queue."
+                                        ),
+                                        retryable=True,
+                                    )
+                                except Exception as e:
+                                    log.warning(
+                                        "Could not return overflow job %s to queue: %s",
+                                        job.get("queue_id"), e,
+                                    )
                         for job in claimed:
                             if _shutdown:
                                 break
