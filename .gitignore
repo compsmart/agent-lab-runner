@@ -1,0 +1,13 @@
+# Local runner config (contains API keys)
+config.yaml
+
+# Virtual environments
+venv/
+.venv/
+
+# Python cache artifacts
+__pycache__/
+*.py[cod]
+
+# Local crash-recovery state
+.agent-lab-runner/

@@ -41,8 +41,9 @@ class StateStore:
                 attempt     INTEGER NOT NULL DEFAULT 1,
                 work_dir    TEXT,
                 status      TEXT    NOT NULL DEFAULT 'claimed',
-                started_at  REAL    NOT NULL DEFAULT (unixepoch()),
-                updated_at  REAL    NOT NULL DEFAULT (unixepoch())
+                -- Use strftime for compatibility with older SQLite builds
+                started_at  REAL    NOT NULL DEFAULT (strftime('%s','now')),
+                updated_at  REAL    NOT NULL DEFAULT (strftime('%s','now'))
             );
             CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
         """)
