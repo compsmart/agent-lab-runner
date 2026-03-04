@@ -1,0 +1,27 @@
+[Unit]
+Description=Agent Lab Remote GPU Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/agent-lab-runner
+ExecStart=/opt/agent-lab-runner/venv/bin/python runner/main.py --config /etc/agent-lab-runner/config.yaml
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=agent-lab-runner
+
+# Hard limits
+TimeoutStopSec=300
+KillMode=mixed
+KillSignal=SIGTERM
+FinalKillSignal=SIGKILL
+
+# Environment
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

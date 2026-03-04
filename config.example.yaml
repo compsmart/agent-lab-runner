@@ -1,0 +1,36 @@
+# Agent Lab Remote Runner — Configuration
+# Copy this file to config.yaml and fill in your values.
+# All fields can also be overridden by environment variables (see below).
+
+# URL of the local Agent Lab FastAPI server (reachable from this machine)
+# Env var: LAB_URL
+lab_url: "https://your-lab-server:8000"
+
+# Unique name for this server — must match the name registered in the lab UI
+# at /system/remote-servers.
+# Env var: SERVER_NAME
+server_name: "gpu-east-1"
+
+# API key issued by the lab when you registered this server.
+# KEEP THIS SECRET. Never commit config.yaml to version control.
+# Env var: API_KEY
+api_key: "rs_1_..."
+
+# Maximum number of experiments to run simultaneously on this machine.
+# Should match max_concurrent set in the lab UI for this server.
+# Env var: MAX_CONCURRENT
+max_concurrent: 1
+
+# Polling intervals
+poll_interval_idle_s: 8     # How often to poll when no jobs are running
+poll_interval_busy_s: 20    # Heartbeat interval when jobs are active
+
+# Working directory for job execution (temp dirs created under here)
+# Defaults to system temp dir if not set.
+work_base_dir: null
+
+# SQLite state file for crash recovery
+state_db: "~/.agent-lab-runner/state.db"
+
+# Remove job work directories after completion
+cleanup_work_dirs: true
