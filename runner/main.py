@@ -222,7 +222,7 @@ async def main(config_path: str):
                 if exc:
                     log.error(f"Job task raised unhandled exception: {exc}")
 
-        while not _shutdown:
+        while True:
             try:
                 # Reap finished tasks
                 for task in list(active_tasks):
@@ -236,7 +236,8 @@ async def main(config_path: str):
                     if hasattr(t, "_job_queue_id")
                 }
 
-                free_slots = max_concurrent - len(active_tasks)
+                # During graceful shutdown, keep heartbeating but do not accept new work.
+                free_slots = 0 if _shutdown else (max_concurrent - len(active_tasks))
                 gpu_info = _get_gpu_info()
 
                 # Heartbeat
@@ -301,14 +302,16 @@ async def main(config_path: str):
                 sleep_s = busy_interval if active_tasks else idle_interval
                 await asyncio.sleep(sleep_s)
 
+                # Exit only after all active jobs have finished reporting.
+                if _shutdown and not active_tasks:
+                    break
+
             except Exception as e:
                 log.exception(f"Unexpected error in main loop: {e}")
                 await asyncio.sleep(5)
 
-        # Graceful shutdown — wait for active jobs to finish
-        if active_tasks:
-            log.info(f"Shutdown: waiting for {len(active_tasks)} active job(s) to finish...")
-            await asyncio.gather(*active_tasks, return_exceptions=True)
+        if _shutdown:
+            log.info("Shutdown complete: no active jobs remaining.")
 
     state_store.close()
     log.info("Remote Runner shut down cleanly.")
