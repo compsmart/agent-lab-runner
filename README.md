@@ -54,10 +54,10 @@ max_concurrent: 1
 
 ```bash
 # Manual run
-python runner/main.py --config config.yaml
+python -m runner.main --config config.yaml
 
 # Or with environment variables (no config file needed)
-LAB_URL=https://... SERVER_NAME=gpu-east-1 API_KEY=rs_1_... python runner/main.py
+LAB_URL=https://... SERVER_NAME=gpu-east-1 API_KEY=rs_1_... python -m runner.main
 ```
 
 ## Systemd Service

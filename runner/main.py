@@ -33,10 +33,18 @@ from typing import Optional
 
 import yaml
 
-from .api_client import RemoteAPIClient
-from .artifacts import collect_results
-from .executor import JobExecutor
-from .state_store import StateStore
+if __package__:
+    from .api_client import RemoteAPIClient
+    from .artifacts import collect_results
+    from .executor import JobExecutor
+    from .state_store import StateStore
+else:
+    # Allow direct script execution: `python runner/main.py`
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from runner.api_client import RemoteAPIClient
+    from runner.artifacts import collect_results
+    from runner.executor import JobExecutor
+    from runner.state_store import StateStore
 
 logging.basicConfig(
     level=logging.INFO,
