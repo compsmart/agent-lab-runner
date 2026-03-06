@@ -1,5 +1,6 @@
-"""Artifact handling: download code tarball, unpack, upload results."""
+"""Artifact handling: download code tarball, unpack, and synthesize benchmark results."""
 import logging
+import json
 import os
 import tarfile
 import tempfile
@@ -66,6 +67,126 @@ def collect_results(work_dir: str) -> dict[str, Optional[str]]:
             result["output_txt"] = os.path.join(root, "output.txt")
 
     return result
+
+
+def collect_benchmark_artifacts(work_dir: str) -> dict[str, Optional[str]]:
+    """Find benchmark run artifacts in a repo checkout.
+
+    Preference order:
+    1. Tracked run directories containing run_spec.json + metrics.json
+    2. Standalone metrics.json/results.json files
+    """
+    newest_tracked: tuple[float, Path] | None = None
+    fallback_metrics: Path | None = None
+    fallback_results: Path | None = None
+    fallback_events: Path | None = None
+    fallback_status: Path | None = None
+
+    for root, _dirs, files in os.walk(work_dir):
+        root_path = Path(root)
+        if {"run_spec.json", "metrics.json"}.issubset(files):
+            marker = root_path / "metrics.json"
+            mtime = marker.stat().st_mtime
+            if newest_tracked is None or mtime > newest_tracked[0]:
+                newest_tracked = (mtime, root_path)
+        if "metrics.json" in files:
+            candidate = root_path / "metrics.json"
+            if fallback_metrics is None or candidate.stat().st_mtime > fallback_metrics.stat().st_mtime:
+                fallback_metrics = candidate
+        if "results.json" in files:
+            candidate = root_path / "results.json"
+            if fallback_results is None or candidate.stat().st_mtime > fallback_results.stat().st_mtime:
+                fallback_results = candidate
+        if "events.jsonl" in files:
+            candidate = root_path / "events.jsonl"
+            if fallback_events is None or candidate.stat().st_mtime > fallback_events.stat().st_mtime:
+                fallback_events = candidate
+        if "status.json" in files:
+            candidate = root_path / "status.json"
+            if fallback_status is None or candidate.stat().st_mtime > fallback_status.stat().st_mtime:
+                fallback_status = candidate
+
+    if newest_tracked:
+        run_dir = newest_tracked[1]
+        return {
+            "run_dir": str(run_dir),
+            "run_spec_json": str(run_dir / "run_spec.json"),
+            "metrics_json": str(run_dir / "metrics.json"),
+            "results_json": str(run_dir / "results.json") if (run_dir / "results.json").exists() else None,
+            "status_json": str(run_dir / "status.json") if (run_dir / "status.json").exists() else None,
+            "events_jsonl": str(run_dir / "events.jsonl") if (run_dir / "events.jsonl").exists() else None,
+        }
+
+    return {
+        "run_dir": None,
+        "run_spec_json": None,
+        "metrics_json": str(fallback_metrics) if fallback_metrics else None,
+        "results_json": str(fallback_results) if fallback_results else None,
+        "status_json": str(fallback_status) if fallback_status else None,
+        "events_jsonl": str(fallback_events) if fallback_events else None,
+    }
+
+
+def build_benchmark_manifest(
+    artifacts: dict[str, Optional[str]],
+    *,
+    agent_name: str,
+    repo_url: str,
+    ref_type: str,
+    ref_value: str,
+    source_sha: str,
+) -> dict:
+    """Build a benchmark manifest compatible with the lab API."""
+    run_spec = _read_json_file(artifacts.get("run_spec_json"))
+    metrics = _read_json_file(artifacts.get("metrics_json"))
+    results = _read_json_file(artifacts.get("results_json"))
+    status = _read_json_file(artifacts.get("status_json"))
+
+    run_id = (
+        (run_spec or {}).get("run_id")
+        or (metrics or {}).get("run_id")
+        or (results or {}).get("run_id")
+    )
+    if not run_id:
+        raise FileNotFoundError("Benchmark artifacts missing run_id")
+
+    run_status = (
+        (status or {}).get("status")
+        or (run_spec or {}).get("status")
+        or "completed"
+    )
+
+    benchmark_run = {
+        "run_id": run_id,
+        "agent_name": agent_name,
+        "name": (run_spec or {}).get("name", ""),
+        "status": run_status,
+        "profile": (run_spec or {}).get("profile", ""),
+        "model_name": (run_spec or {}).get("model_name", ""),
+        "suites": (run_spec or {}).get("suites", []),
+        "baselines": (run_spec or {}).get("baselines", []),
+        "suite_weights": (metrics or {}).get("suite_weights", {}),
+        "aggregate_scores": (metrics or {}).get("aggregate_scores", []),
+        "suite_results": (results or {}).get("suite_results", []),
+        "created_at": (run_spec or {}).get("created_at"),
+    }
+    return {
+        "agent_name": agent_name,
+        "repo_url": repo_url,
+        "ref_type": ref_type,
+        "ref_value": ref_value,
+        "source_sha": source_sha,
+        "benchmark_run": benchmark_run,
+    }
+
+
+def _read_json_file(path: Optional[str]) -> dict:
+    if not path:
+        return {}
+    try:
+        return json.loads(Path(path).read_text())
+    except (OSError, json.JSONDecodeError, TypeError):
+        return {}
 
 
 def create_work_dir(base_dir: Optional[str] = None) -> str:

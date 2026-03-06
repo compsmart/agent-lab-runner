@@ -3,12 +3,23 @@ import asyncio
 import json
 import logging
 import os
+import shutil
+import subprocess
+import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from typing import Optional
 
 from .api_client import RemoteAPIClient
-from .artifacts import unpack_tarball, find_run_py, collect_results, cleanup_work_dir
+from .artifacts import (
+    unpack_tarball,
+    find_run_py,
+    collect_results,
+    collect_benchmark_artifacts,
+    build_benchmark_manifest,
+    cleanup_work_dir,
+)
 from .state_store import StateStore
 
 log = logging.getLogger("runner.executor")
@@ -17,6 +28,23 @@ PROGRESS_INTERVAL_S = 20   # send heartbeat/progress every N seconds
 OUTPUT_TAIL_CHARS = 4000   # chars to send in progress log_tail
 DEFAULT_CHECKPOINT_DIR_NAME = "checkpoints"
 DEFAULT_CHECKPOINT_LATEST_FILE = "latest.json"
+
+
+def _resolve_python_interpreter() -> str:
+    """Pick a Python executable available on this host.
+
+    Preference order:
+    1. Current runner interpreter (keeps env/venv consistent)
+    2. python3 on PATH
+    3. python on PATH
+    """
+    if sys.executable and os.path.exists(sys.executable):
+        return sys.executable
+    for candidate in ("python3", "python"):
+        found = shutil.which(candidate)
+        if found:
+            return found
+    raise FileNotFoundError("No Python interpreter found (tried sys.executable, python3, python)")
 
 
 class JobExecutor:
@@ -49,6 +77,11 @@ class JobExecutor:
 
         Returns True on success, False on failure.
         """
+        if (job.get("job_type") or "experiment_run") == "agent_benchmark":
+            return await self._execute_agent_benchmark(job)
+        return await self._execute_experiment_job(job)
+
+    async def _execute_experiment_job(self, job: dict) -> bool:
         queue_id = job["queue_id"]
         lease_token = job["lease_token"]
         code_path = job.get("code_path")
@@ -67,8 +100,6 @@ class JobExecutor:
         resume_info = job.get("resume") or {}
         resume_checkpoint = resume_info.get("latest_checkpoint") if isinstance(resume_info, dict) else None
 
-        # Create isolated work directory
-        import tempfile
         work_dir = tempfile.mkdtemp(prefix=f"job-{queue_id}-", dir=self._work_base)
         tarball_path = os.path.join(work_dir, "code.tar.gz")
         checkpoint_state: dict = {
@@ -200,6 +231,165 @@ class JobExecutor:
             if self._cleanup:
                 cleanup_work_dir(work_dir)
 
+    async def _execute_agent_benchmark(self, job: dict) -> bool:
+        queue_id = job["queue_id"]
+        lease_token = job["lease_token"]
+        payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+        repo_url = job.get("repo_url") or payload.get("repo_url")
+        ref_type = job.get("ref_type") or payload.get("ref_type")
+        ref_value = job.get("ref_value") or payload.get("ref_value")
+        benchmark_command = job.get("benchmark_command") or payload.get("benchmark_command")
+        work_subdir = job.get("work_subdir") or payload.get("work_subdir") or ""
+        extra_env = job.get("env") if isinstance(job.get("env"), dict) else payload.get("env")
+        work_dir = tempfile.mkdtemp(prefix=f"job-{queue_id}-", dir=self._work_base)
+        output_path = os.path.join(work_dir, "output.txt")
+
+        if not repo_url or not ref_type or not ref_value or not benchmark_command:
+            raise FileNotFoundError(
+                "agent_benchmark payload missing repo_url/ref_type/ref_value/benchmark_command"
+            )
+
+        self._store.upsert_job(
+            queue_id=queue_id,
+            lease_token=lease_token,
+            attempt=job.get("attempt", 1),
+            work_dir=work_dir,
+            status="claimed",
+        )
+
+        try:
+            repo_dir = os.path.join(work_dir, "repo")
+            await asyncio.to_thread(self._clone_repo, repo_url, ref_type, ref_value, repo_dir)
+            source_sha = await asyncio.to_thread(
+                subprocess.check_output,
+                ["git", "rev-parse", "HEAD"],
+                cwd=repo_dir,
+                text=True,
+            )
+            source_sha = source_sha.strip()
+
+            run_cwd = repo_dir
+            if work_subdir:
+                run_cwd = os.path.join(repo_dir, work_subdir)
+            if not os.path.isdir(run_cwd):
+                raise FileNotFoundError(f"benchmark work_subdir not found: {work_subdir}")
+
+            await self._client.job_start(queue_id, lease_token)
+            self._store.upsert_job(
+                queue_id=queue_id,
+                lease_token=lease_token,
+                attempt=job.get("attempt", 1),
+                work_dir=work_dir,
+                status="executing",
+            )
+
+            success, return_code = await self._run_command_subprocess(
+                queue_id=queue_id,
+                lease_token=lease_token,
+                command=benchmark_command,
+                cwd=run_cwd,
+                output_path=output_path,
+                extra_env=extra_env if isinstance(extra_env, dict) else {},
+            )
+
+            self._store.upsert_job(
+                queue_id=queue_id,
+                lease_token=lease_token,
+                attempt=job.get("attempt", 1),
+                work_dir=work_dir,
+                status="uploading",
+            )
+
+            if success:
+                artifacts = collect_benchmark_artifacts(repo_dir)
+                manifest = build_benchmark_manifest(
+                    artifacts,
+                    agent_name=payload.get("agent_name") or job.get("experiment_slug") or "unknown",
+                    repo_url=repo_url,
+                    ref_type=ref_type,
+                    ref_value=ref_value,
+                    source_sha=source_sha,
+                )
+                manifest_path = os.path.join(work_dir, "benchmark_manifest.json")
+                with open(manifest_path, "w") as f:
+                    json.dump(manifest, f, indent=2)
+
+                await self._client.job_complete(
+                    queue_id=queue_id,
+                    lease_token=lease_token,
+                    results_json_path=manifest_path,
+                    output_txt_path=output_path if os.path.exists(output_path) else None,
+                    summary=f"return_code={return_code}",
+                )
+                self._store.mark_done(queue_id)
+                log.info(f"[job {queue_id}] Agent benchmark completed successfully")
+                return True
+
+            log_tail = ""
+            if os.path.exists(output_path):
+                with open(output_path, errors="replace") as f:
+                    log_tail = f.read()[-OUTPUT_TAIL_CHARS:]
+            await self._client.job_fail(
+                queue_id=queue_id,
+                lease_token=lease_token,
+                error_code="NONZERO_EXIT",
+                message=f"benchmark command exited with return_code={return_code}",
+                retryable=False,
+                log_tail=log_tail,
+            )
+            self._store.mark_done(queue_id)
+            log.warning(f"[job {queue_id}] Agent benchmark failed with return_code={return_code}")
+            return False
+
+        except FileNotFoundError as e:
+            log.error(f"[job {queue_id}] Setup error: {e}")
+            await self._safe_fail(queue_id, lease_token, "SETUP_ERROR", str(e), retryable=False)
+            return False
+        except subprocess.CalledProcessError as e:
+            stderr = (e.stderr or "").strip() if isinstance(e.stderr, str) else str(e)
+            message = stderr or str(e)
+            log.error(f"[job {queue_id}] Agent benchmark setup command failed: {message}")
+            await self._safe_fail(queue_id, lease_token, "SETUP_ERROR", message, retryable=False)
+            return False
+        except asyncio.CancelledError:
+            log.warning(f"[job {queue_id}] Agent benchmark cancelled")
+            await self._safe_fail(queue_id, lease_token, "CANCELLED", "Job was cancelled", retryable=True)
+            raise
+        except Exception as e:
+            log.exception(f"[job {queue_id}] Agent benchmark unexpected error: {e}")
+            await self._safe_fail(queue_id, lease_token, "RUNTIME_ERROR", str(e), retryable=True)
+            return False
+        finally:
+            if self._cleanup:
+                cleanup_work_dir(work_dir)
+
+    def _clone_repo(self, repo_url: str, ref_type: str, ref_value: str, dest_dir: str) -> None:
+        subprocess.run(
+            ["git", "clone", repo_url, dest_dir],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if ref_type == "branch":
+            subprocess.run(
+                ["git", "checkout", "-B", ref_value, f"origin/{ref_value}"],
+                check=True,
+                cwd=dest_dir,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            return
+        subprocess.run(
+            ["git", "checkout", ref_value],
+            check=True,
+            cwd=dest_dir,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
     async def _run_subprocess(
         self,
         queue_id: int,
@@ -212,6 +402,7 @@ class JobExecutor:
         """Run run.py, capturing output and sending periodic progress heartbeats."""
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
+        python_exec = _resolve_python_interpreter()
         checkpoint_dir = checkpoint_state.get("checkpoint_dir")
         latest_path = checkpoint_state.get("latest_path")
         if checkpoint_dir and latest_path:
@@ -220,11 +411,11 @@ class JobExecutor:
             env["AGENT_LAB_CHECKPOINT_LATEST_JSON"] = latest_path
             env["AGENT_LAB_RESTORE_DIR"] = checkpoint_dir
 
-        log.info(f"[job {queue_id}] Running: python3 {run_py} in {cwd}")
+        log.info(f"[job {queue_id}] Running: {python_exec} {run_py} in {cwd}")
 
         with open(output_path, "w") as out_f:
             proc = await asyncio.create_subprocess_exec(
-                "python3", run_py,
+                python_exec, run_py,
                 cwd=cwd,
                 env=env,
                 stdout=out_f,
@@ -281,6 +472,73 @@ class JobExecutor:
                 ):
                     await self._upload_latest_checkpoint_if_changed(queue_id, lease_token, checkpoint_state)
                     last_checkpoint_sync = now
+        finally:
+            if proc.returncode is None:
+                await self._terminate_process(proc, queue_id, "executor exiting")
+
+        return_code = proc.returncode
+        return (return_code == 0), return_code
+
+    async def _run_command_subprocess(
+        self,
+        queue_id: int,
+        lease_token: str,
+        command: str,
+        cwd: str,
+        output_path: str,
+        extra_env: dict,
+    ) -> tuple[bool, int]:
+        """Run an arbitrary benchmark command with progress heartbeats."""
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        for key, value in (extra_env or {}).items():
+            if isinstance(key, str) and isinstance(value, (str, int, float)):
+                env[key] = str(value)
+
+        log.info(f"[job {queue_id}] Running benchmark command: {command} in {cwd}")
+        with open(output_path, "w") as out_f:
+            proc = await asyncio.create_subprocess_exec(
+                "/bin/sh", "-lc", command,
+                cwd=cwd,
+                env=env,
+                stdout=out_f,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+
+        start_time = time.time()
+        last_heartbeat = start_time
+        try:
+            while True:
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=1.0)
+                    break
+                except asyncio.TimeoutError:
+                    pass
+
+                now = time.time()
+                if now - last_heartbeat < PROGRESS_INTERVAL_S:
+                    continue
+
+                log_tail = ""
+                try:
+                    with open(output_path, errors="replace") as f:
+                        log_tail = f.read()[-OUTPUT_TAIL_CHARS:]
+                except Exception:
+                    pass
+
+                elapsed = int(now - start_time)
+                result = await self._client.job_progress(
+                    queue_id=queue_id,
+                    lease_token=lease_token,
+                    eta_seconds=None,
+                    metrics={"elapsed_s": elapsed, "command": command},
+                    log_tail=log_tail,
+                )
+                if result.get("stale"):
+                    log.warning(f"[job {queue_id}] Stale lease detected during benchmark command")
+                    await self._terminate_process(proc, queue_id, "stale lease")
+                    return False, -1
+                last_heartbeat = now
         finally:
             if proc.returncode is None:
                 await self._terminate_process(proc, queue_id, "executor exiting")
