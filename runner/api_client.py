@@ -243,9 +243,23 @@ class RemoteAPIClient:
         resp.raise_for_status()
         return resp.json()
 
-    async def download_tarball(self, queue_id: int, tarball_url: str, tarball_token: str, dest_path: str) -> None:
+    async def download_tarball(
+        self,
+        queue_id: int,
+        tarball_url: str,
+        tarball_token: Optional[str],
+        dest_path: str,
+    ) -> None:
         """Download the code tarball for a job to dest_path."""
-        url = f"{self._lab_url}{tarball_url}?token={tarball_token}"
+        if tarball_url.startswith(("http://", "https://")):
+            url = tarball_url
+        else:
+            url = f"{self._lab_url}{tarball_url}"
+
+        if tarball_token:
+            joiner = "&" if "?" in url else "?"
+            url = f"{url}{joiner}token={tarball_token}"
+
         async with self._client.stream("GET", url) as resp:
             resp.raise_for_status()
             with open(dest_path, "wb") as f:

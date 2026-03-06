@@ -51,9 +51,17 @@ class JobExecutor:
         """
         queue_id = job["queue_id"]
         lease_token = job["lease_token"]
-        code_path = job["code_path"]
-        tarball_url = job["tarball_url"]
-        tarball_token = job["tarball_token"]
+        code_path = job.get("code_path")
+        tarball_url = (
+            job.get("tarball_url")
+            or job.get("artifact_url")
+            or job.get("code_tarball_url")
+        )
+        tarball_token = (
+            job.get("tarball_token")
+            or job.get("artifact_token")
+            or job.get("download_token")
+        )
         experiment_id = job.get("experiment_id")
         lineage_id = job.get("lineage_id")
         resume_info = job.get("resume") or {}
@@ -79,6 +87,16 @@ class JobExecutor:
         )
 
         try:
+            if not code_path:
+                raise FileNotFoundError("Claim payload missing required key: code_path")
+            if not tarball_url:
+                known_keys = ", ".join(sorted(job.keys()))
+                raise FileNotFoundError(
+                    "Claim payload missing tarball URL key "
+                    f"(expected one of: tarball_url, artifact_url, code_tarball_url). "
+                    f"Payload keys: {known_keys}"
+                )
+
             # 1. Download tarball
             log.info(f"[job {queue_id}] Downloading code tarball...")
             await self._client.download_tarball(queue_id, tarball_url, tarball_token, tarball_path)
