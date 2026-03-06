@@ -122,14 +122,46 @@ def _get_gpu_info() -> dict:
             capture_output=True, text=True, timeout=5,
         )
         if result.returncode == 0:
-            parts = result.stdout.strip().split(",")
-            if len(parts) >= 4:
-                return {
-                    "name": parts[0].strip(),
-                    "memory_total_mb": int(parts[1].strip()),
-                    "memory_free_mb": int(parts[2].strip()),
-                    "utilization_pct": int(parts[3].strip()),
-                }
+            gpus = []
+            for raw_line in result.stdout.splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) < 4:
+                    continue
+                try:
+                    gpus.append(
+                        {
+                            "name": parts[0],
+                            "memory_total_mb": int(parts[1]),
+                            "memory_free_mb": int(parts[2]),
+                            "utilization_pct": int(parts[3]),
+                        }
+                    )
+                except (TypeError, ValueError):
+                    continue
+
+            if not gpus:
+                return {}
+
+            if len(gpus) == 1:
+                return gpus[0]
+
+            total_mem = sum(g["memory_total_mb"] for g in gpus)
+            free_mem = sum(g["memory_free_mb"] for g in gpus)
+            avg_util = int(round(sum(g["utilization_pct"] for g in gpus) / len(gpus)))
+            primary_name = gpus[0]["name"]
+            mixed_names = any(g["name"] != primary_name for g in gpus[1:])
+
+            return {
+                "name": primary_name if not mixed_names else "multi-gpu",
+                "gpu_count": len(gpus),
+                "memory_total_mb": total_mem,
+                "memory_free_mb": free_mem,
+                "utilization_pct": avg_util,
+                "gpus": gpus,
+            }
     except Exception:
         pass
     return {}
