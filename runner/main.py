@@ -81,6 +81,10 @@ def load_config(path: str) -> dict:
     cfg.setdefault("work_base_dir", None)
     cfg.setdefault("state_db", os.path.expanduser("~/.agent-lab-runner/state.db"))
     cfg.setdefault("cleanup_work_dirs", True)
+    cfg.setdefault("checkpoint_sync_enabled", True)
+    cfg.setdefault("checkpoint_sync_interval_s", 300)
+    cfg.setdefault("checkpoint_dir_name", "checkpoints")
+    cfg.setdefault("checkpoint_latest_file", "latest.json")
 
     for required in ("lab_url", "server_name", "api_key"):
         if not cfg.get(required):
@@ -200,6 +204,10 @@ async def main(config_path: str):
     work_base = cfg["work_base_dir"]
     cleanup = cfg["cleanup_work_dirs"]
     state_db = cfg["state_db"]
+    checkpoint_sync_enabled = bool(cfg["checkpoint_sync_enabled"])
+    checkpoint_sync_interval_s = int(cfg["checkpoint_sync_interval_s"])
+    checkpoint_dir_name = cfg["checkpoint_dir_name"]
+    checkpoint_latest_file = cfg["checkpoint_latest_file"]
 
     log.info(
         f"Remote Runner starting: server={server_name} lab={lab_url} "
@@ -215,6 +223,10 @@ async def main(config_path: str):
             state_store=state_store,
             work_base_dir=work_base,
             cleanup_on_finish=cleanup,
+            checkpoint_sync_enabled=checkpoint_sync_enabled,
+            checkpoint_sync_interval_s=checkpoint_sync_interval_s,
+            checkpoint_dir_name=checkpoint_dir_name,
+            checkpoint_latest_file=checkpoint_latest_file,
         )
 
         # Crash recovery on startup

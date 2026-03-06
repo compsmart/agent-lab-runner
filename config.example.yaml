@@ -34,3 +34,13 @@ state_db: "~/.agent-lab-runner/state.db"
 
 # Remove job work directories after completion
 cleanup_work_dirs: true
+
+# Enable checkpoint upload/restore for resumable requeued jobs
+checkpoint_sync_enabled: true
+
+# Upload latest checkpoint every N seconds while run.py is still running
+checkpoint_sync_interval_s: 300
+
+# Checkpoint directory + pointer file relative to the experiment runtime
+checkpoint_dir_name: "checkpoints"
+checkpoint_latest_file: "latest.json"

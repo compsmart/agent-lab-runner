@@ -227,6 +227,9 @@ class RemoteAPIClient:
                 "log_tail": log_tail,
             },
         )
+        if resp.status_code == 409:
+            log.warning(f"Fail for job {queue_id}: stale lease — {resp.text}")
+            return {"stale": True}
         resp.raise_for_status()
         return resp.json()
 
@@ -249,3 +252,66 @@ class RemoteAPIClient:
                 async for chunk in resp.aiter_bytes(65536):
                     f.write(chunk)
         log.info(f"Downloaded tarball for job {queue_id} to {dest_path}")
+
+    async def job_checkpoint_latest(self, queue_id: int, lease_token: str) -> dict:
+        resp = await self._request(
+            "GET", f"/jobs/{queue_id}/checkpoint/latest",
+            params={"lease_token": lease_token},
+        )
+        if resp.status_code == 409:
+            log.warning(f"Checkpoint latest for job {queue_id}: stale lease — {resp.text}")
+            return {"stale": True}
+        resp.raise_for_status()
+        return resp.json()
+
+    async def job_checkpoint_upload(
+        self,
+        queue_id: int,
+        lease_token: str,
+        manifest_json: str,
+        checkpoint_path: str,
+        kind: str = "latest",
+    ) -> dict:
+        file_obj = open(checkpoint_path, "rb")
+        files = [
+            ("checkpoint_file", (checkpoint_path.split("/")[-1], file_obj, "application/octet-stream")),
+        ]
+        data = {
+            "lease_token": lease_token,
+            "manifest_json": manifest_json,
+            "kind": kind,
+        }
+        try:
+            resp = await self._request(
+                "POST", f"/jobs/{queue_id}/checkpoint",
+                data=data,
+                files=files,
+            )
+        finally:
+            file_obj.close()
+        if resp.status_code == 409:
+            log.warning(f"Checkpoint upload for job {queue_id}: stale lease — {resp.text}")
+            return {"stale": True}
+        resp.raise_for_status()
+        return resp.json()
+
+    async def download_checkpoint(
+        self,
+        queue_id: int,
+        checkpoint_id: int,
+        download_url: str,
+        download_token: str,
+        dest_path: str,
+    ) -> None:
+        url = f"{self._lab_url}{download_url}?token={download_token}"
+        async with self._client.stream("GET", url) as resp:
+            resp.raise_for_status()
+            with open(dest_path, "wb") as f:
+                async for chunk in resp.aiter_bytes(65536):
+                    f.write(chunk)
+        log.info(
+            "Downloaded checkpoint %s for job %s to %s",
+            checkpoint_id,
+            queue_id,
+            dest_path,
+        )
