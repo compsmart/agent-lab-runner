@@ -120,6 +120,20 @@ On startup, the runner checks a local SQLite state file (`~/.agent-lab-runner/st
 for jobs that were in-progress when it last crashed. It attempts to upload any
 saved results or reports failure so the lab can requeue the job.
 
+## Lab-triggered Runner Updates
+
+From the lab UI (`/system/remote-servers`), admins can click **Request Runner Update**
+for a connected server.
+
+When requested, the runner:
+- waits until it is idle (no active jobs),
+- atomically claims the update request,
+- runs a git-based self-update (`fetch` + `pull --ff-only`),
+- temporarily stashes untracked/generated files so updates are not blocked,
+- reports `succeeded` or `failed` status back to the lab.
+
+If the revision changed, the runner process self-restarts to load new code.
+
 ## Troubleshooting
 
 | Symptom | Likely cause |

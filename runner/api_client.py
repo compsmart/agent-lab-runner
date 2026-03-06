@@ -131,6 +131,31 @@ class RemoteAPIClient:
         resp.raise_for_status()
         return resp.json().get("claimed", [])
 
+    async def runner_update_start(self) -> dict:
+        resp = await self._request("POST", "/worker/runner-update/start", json={})
+        resp.raise_for_status()
+        return resp.json()
+
+    async def runner_update_complete(
+        self,
+        status: str,
+        message: str = "",
+        previous_revision: Optional[str] = None,
+        new_revision: Optional[str] = None,
+    ) -> dict:
+        resp = await self._request(
+            "POST",
+            "/worker/runner-update/complete",
+            json={
+                "status": status,
+                "message": message,
+                "previous_revision": previous_revision,
+                "new_revision": new_revision,
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()
+
     async def job_start(self, queue_id: int, lease_token: str) -> dict:
         idem_key = f"start-{queue_id}-{lease_token[:8]}"
         resp = await self._request(

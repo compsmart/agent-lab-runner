@@ -47,3 +47,7 @@ checkpoint_latest_file: "latest.json"
 
 # Durable local checkpoint store (per experiment/lineage)
 checkpoint_store_root: "~/.agent-lab-runner/checkpoints"
+
+# Optional: explicit git repo root used for lab-triggered runner self-updates.
+# Defaults to the parent directory of runner/main.py.
+runner_repo_dir: null

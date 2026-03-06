@@ -28,7 +28,9 @@ import fcntl
 import logging
 import os
 import signal
+import subprocess
 import sys
+import time
 from typing import Optional
 
 import yaml
@@ -86,6 +88,7 @@ def load_config(path: str) -> dict:
     cfg.setdefault("checkpoint_dir_name", "checkpoints")
     cfg.setdefault("checkpoint_latest_file", "latest.json")
     cfg.setdefault("checkpoint_store_root", "~/.agent-lab-runner/checkpoints")
+    cfg.setdefault("runner_repo_dir", None)
 
     for required in ("lab_url", "server_name", "api_key"):
         if not cfg.get(required):
@@ -167,6 +170,70 @@ def _get_gpu_info() -> dict:
     return {}
 
 
+def _runner_repo_dir() -> str:
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+
+def _git_run(repo_dir: str, args: list[str], *, check: bool = True, timeout: int = 180) -> subprocess.CompletedProcess:
+    cmd = ["git", "-C", repo_dir] + args
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if check and proc.returncode != 0:
+        stderr = (proc.stderr or "").strip()
+        stdout = (proc.stdout or "").strip()
+        detail = stderr or stdout or f"exit={proc.returncode}"
+        raise RuntimeError(f"{' '.join(cmd)} failed: {detail}")
+    return proc
+
+
+def _perform_runner_self_update(repo_dir: str) -> dict:
+    """Update runner code from git while tolerating untracked/generated files."""
+    inside = _git_run(repo_dir, ["rev-parse", "--is-inside-work-tree"]).stdout.strip()
+    if inside != "true":
+        raise RuntimeError(f"{repo_dir} is not a git worktree")
+
+    prev_rev = _git_run(repo_dir, ["rev-parse", "--short", "HEAD"]).stdout.strip()
+    branch_proc = _git_run(repo_dir, ["symbolic-ref", "--short", "HEAD"], check=False)
+    branch = branch_proc.stdout.strip() if branch_proc.returncode == 0 else "HEAD"
+
+    # Safety: never discard tracked local edits automatically.
+    dirty_tracked = _git_run(repo_dir, ["status", "--porcelain", "--untracked-files=no"]).stdout.strip()
+    if dirty_tracked:
+        raise RuntimeError("Refusing auto-update: tracked local changes are present")
+
+    stash_before = _git_run(repo_dir, ["rev-parse", "-q", "--verify", "refs/stash"], check=False).stdout.strip()
+    stash_cmd = _git_run(
+        repo_dir,
+        ["stash", "push", "--include-untracked", "-m", f"runner-auto-update-{int(time.time())}"],
+        check=False,
+    )
+    if stash_cmd.returncode != 0:
+        raise RuntimeError((stash_cmd.stderr or stash_cmd.stdout or "git stash failed").strip())
+    stash_after = _git_run(repo_dir, ["rev-parse", "-q", "--verify", "refs/stash"], check=False).stdout.strip()
+    stash_created = bool(stash_after and stash_after != stash_before)
+
+    _git_run(repo_dir, ["fetch", "--all", "--prune"])
+    _git_run(repo_dir, ["pull", "--ff-only"])
+
+    # Drop temp stash so generated/untracked files stay ignored for update purposes.
+    if stash_created:
+        _git_run(repo_dir, ["stash", "drop", "stash@{0}"], check=False)
+
+    new_rev = _git_run(repo_dir, ["rev-parse", "--short", "HEAD"]).stdout.strip()
+    changed = prev_rev != new_rev
+    message = f"Updated branch={branch} {prev_rev} -> {new_rev}" if changed else f"Already up to date on {branch} ({prev_rev})"
+    return {
+        "message": message,
+        "previous_revision": prev_rev,
+        "new_revision": new_rev,
+        "changed": changed,
+    }
+
+
 async def recover_incomplete_jobs(
     client: RemoteAPIClient,
     state_store: StateStore,
@@ -242,6 +309,7 @@ async def main(config_path: str):
     checkpoint_dir_name = cfg["checkpoint_dir_name"]
     checkpoint_latest_file = cfg["checkpoint_latest_file"]
     checkpoint_store_root = os.path.expanduser(cfg["checkpoint_store_root"])
+    runner_repo_dir = cfg.get("runner_repo_dir") or _runner_repo_dir()
 
     log.info(
         f"Remote Runner starting: server={server_name} lab={lab_url} "
@@ -296,8 +364,9 @@ async def main(config_path: str):
                 gpu_info = _get_gpu_info()
 
                 # Heartbeat
+                hb = {}
                 try:
-                    await client.heartbeat(
+                    hb = await client.heartbeat(
                         server_name=server_name,
                         free_slots=free_slots,
                         current_jobs=list(active_queue_ids),
@@ -305,6 +374,43 @@ async def main(config_path: str):
                     )
                 except Exception as e:
                     log.warning(f"Heartbeat failed: {e}")
+
+                control = hb.get("control") if isinstance(hb, dict) else None
+                runner_update = control.get("runner_update") if isinstance(control, dict) else None
+                update_requested = bool(
+                    isinstance(runner_update, dict)
+                    and runner_update.get("status") == "requested"
+                )
+                if update_requested and not active_tasks and not _shutdown:
+                    try:
+                        claim = await client.runner_update_start()
+                        if claim.get("accepted"):
+                            log.info("Runner self-update requested by lab; executing git update")
+                            result = await asyncio.to_thread(_perform_runner_self_update, runner_repo_dir)
+                            await client.runner_update_complete(
+                                status="succeeded",
+                                message=result["message"],
+                                previous_revision=result.get("previous_revision"),
+                                new_revision=result.get("new_revision"),
+                            )
+                            if result.get("changed"):
+                                log.info("Runner code changed after update; restarting process")
+                                os.execv(sys.executable, [sys.executable] + sys.argv)
+                        else:
+                            log.info("Runner update request was already handled by another process")
+                    except Exception as e:
+                        err_msg = str(e)[:2000]
+                        log.error(f"Runner self-update failed: {err_msg}")
+                        try:
+                            await client.runner_update_complete(
+                                status="failed",
+                                message=err_msg,
+                            )
+                        except Exception as report_err:
+                            log.warning(f"Could not report runner update failure: {report_err}")
+                    # Do not claim new jobs in the same loop iteration.
+                    await asyncio.sleep(1)
+                    continue
 
                 # Claim new jobs if we have slots
                 if free_slots > 0 and not _shutdown:
