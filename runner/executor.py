@@ -3,8 +3,8 @@ import asyncio
 import json
 import logging
 import os
-import shutil
 import time
+from datetime import datetime, timezone
 from typing import Optional
 
 from .api_client import RemoteAPIClient
@@ -30,6 +30,7 @@ class JobExecutor:
         checkpoint_sync_interval_s: int = 300,
         checkpoint_dir_name: str = DEFAULT_CHECKPOINT_DIR_NAME,
         checkpoint_latest_file: str = DEFAULT_CHECKPOINT_LATEST_FILE,
+        checkpoint_store_root: Optional[str] = None,
     ):
         self._client = client
         self._store = state_store
@@ -39,6 +40,9 @@ class JobExecutor:
         self._checkpoint_sync_interval_s = max(20, checkpoint_sync_interval_s)
         self._checkpoint_dir_name = checkpoint_dir_name
         self._checkpoint_latest_file = checkpoint_latest_file
+        self._checkpoint_store_root = os.path.expanduser(
+            checkpoint_store_root or "~/.agent-lab-runner/checkpoints"
+        )
 
     async def execute(self, job: dict) -> bool:
         """Execute a claimed job end-to-end.
@@ -50,6 +54,8 @@ class JobExecutor:
         code_path = job["code_path"]
         tarball_url = job["tarball_url"]
         tarball_token = job["tarball_token"]
+        experiment_id = job.get("experiment_id")
+        lineage_id = job.get("lineage_id")
         resume_info = job.get("resume") or {}
         resume_checkpoint = resume_info.get("latest_checkpoint") if isinstance(resume_info, dict) else None
 
@@ -90,9 +96,8 @@ class JobExecutor:
 
             checkpoint_dir, latest_path = await self._prepare_resume_checkpoint(
                 queue_id=queue_id,
-                lease_token=lease_token,
-                run_py=run_py,
-                work_dir=work_dir,
+                experiment_id=experiment_id,
+                lineage_id=lineage_id,
                 resume_checkpoint=resume_checkpoint,
             )
             checkpoint_state["checkpoint_dir"] = checkpoint_dir
@@ -268,66 +273,48 @@ class JobExecutor:
     async def _prepare_resume_checkpoint(
         self,
         queue_id: int,
-        lease_token: str,
-        run_py: str,
-        work_dir: str,
+        experiment_id: Optional[int],
+        lineage_id: Optional[str],
         resume_checkpoint: Optional[dict],
     ) -> tuple[str, str]:
-        checkpoint_dir = os.path.join(os.path.dirname(run_py), self._checkpoint_dir_name)
+        exp_key = str(experiment_id) if experiment_id is not None else "unknown"
+        lineage_key = str(lineage_id).replace("/", "_").replace("..", "_") if lineage_id else f"queue_{queue_id}"
+        base_dir = os.path.join(
+            self._checkpoint_store_root,
+            f"exp_{exp_key}",
+            f"lineage_{lineage_key}",
+        )
+        checkpoint_dir = os.path.join(base_dir, self._checkpoint_dir_name)
         latest_path = os.path.join(checkpoint_dir, self._checkpoint_latest_file)
         os.makedirs(checkpoint_dir, exist_ok=True)
+        os.makedirs(os.path.dirname(latest_path), exist_ok=True)
 
         if not self._checkpoint_sync_enabled:
             return checkpoint_dir, latest_path
 
-        checkpoint_meta = resume_checkpoint
-        if not checkpoint_meta:
+        if os.path.isfile(latest_path):
             try:
-                latest_resp = await self._client.job_checkpoint_latest(queue_id, lease_token)
-                checkpoint_meta = latest_resp.get("latest_checkpoint") if isinstance(latest_resp, dict) else None
+                with open(latest_path) as f:
+                    manifest = json.load(f)
+                rel_checkpoint_path = manifest.get("checkpoint_path") if isinstance(manifest, dict) else None
+                if isinstance(rel_checkpoint_path, str) and rel_checkpoint_path.strip():
+                    rel_checkpoint_path = rel_checkpoint_path.lstrip("/").replace("..", "_")
+                    prefix = f"{self._checkpoint_dir_name.strip('/')}/"
+                    if rel_checkpoint_path.startswith(prefix):
+                        rel_checkpoint_path = rel_checkpoint_path[len(prefix):]
+                    target_path = os.path.join(checkpoint_dir, rel_checkpoint_path)
+                    if os.path.isfile(target_path):
+                        log.info(f"[job {queue_id}] Found local checkpoint at {target_path}")
+                        return checkpoint_dir, latest_path
             except Exception as e:
-                log.warning(f"[job {queue_id}] Could not query latest checkpoint metadata: {e}")
-                checkpoint_meta = None
+                log.warning(f"[job {queue_id}] Invalid local latest checkpoint pointer: {e}")
 
-        if not checkpoint_meta:
-            return checkpoint_dir, latest_path
-
-        try:
-            filename = checkpoint_meta["filename"]
-            download_url = checkpoint_meta["download_url"]
-            download_token = checkpoint_meta["download_token"]
-            checkpoint_id = checkpoint_meta["checkpoint_id"]
-            manifest = checkpoint_meta.get("manifest_json") or {}
-
-            restore_tmp = os.path.join(work_dir, "restore")
-            os.makedirs(restore_tmp, exist_ok=True)
-            downloaded_path = os.path.join(restore_tmp, filename)
-            await self._client.download_checkpoint(
-                queue_id=queue_id,
-                checkpoint_id=checkpoint_id,
-                download_url=download_url,
-                download_token=download_token,
-                dest_path=downloaded_path,
+        if isinstance(resume_checkpoint, dict):
+            remote_pct = resume_checkpoint.get("progress_percent")
+            remote_server = resume_checkpoint.get("server_name") or resume_checkpoint.get("server_id")
+            log.info(
+                f"[job {queue_id}] No local checkpoint found; remote metadata indicates {remote_pct}% on {remote_server}"
             )
-
-            rel_checkpoint_path = manifest.get("checkpoint_path")
-            if not isinstance(rel_checkpoint_path, str) or not rel_checkpoint_path.strip():
-                rel_checkpoint_path = filename
-            rel_checkpoint_path = rel_checkpoint_path.lstrip("/").replace("..", "_")
-            target_path = os.path.join(checkpoint_dir, rel_checkpoint_path)
-            os.makedirs(os.path.dirname(target_path), exist_ok=True)
-            shutil.copyfile(downloaded_path, target_path)
-
-            manifest_out = dict(manifest) if isinstance(manifest, dict) else {}
-            manifest_out["checkpoint_path"] = rel_checkpoint_path
-            if "restored_from_checkpoint_id" not in manifest_out:
-                manifest_out["restored_from_checkpoint_id"] = checkpoint_id
-            with open(latest_path, "w") as f:
-                json.dump(manifest_out, f, indent=2)
-
-            log.info(f"[job {queue_id}] Restored checkpoint to {target_path}")
-        except Exception as e:
-            log.warning(f"[job {queue_id}] Checkpoint restore failed, starting fresh: {e}")
 
         return checkpoint_dir, latest_path
 
@@ -349,6 +336,9 @@ class JobExecutor:
                 return
 
             rel_checkpoint = rel_checkpoint.lstrip("/").replace("..", "_")
+            prefix = f"{self._checkpoint_dir_name.strip('/')}/"
+            if rel_checkpoint.startswith(prefix):
+                rel_checkpoint = rel_checkpoint[len(prefix):]
             checkpoint_path = os.path.join(checkpoint_dir, rel_checkpoint)
             if not os.path.isfile(checkpoint_path):
                 return
@@ -358,11 +348,27 @@ class JobExecutor:
             if checkpoint_state.get("last_upload_sig") == signature:
                 return
 
-            resp = await self._client.job_checkpoint_upload(
+            progress_percent = None
+            for candidate in (
+                manifest.get("percent"),
+                (manifest.get("progress") or {}).get("percent") if isinstance(manifest.get("progress"), dict) else None,
+            ):
+                if candidate is None:
+                    continue
+                try:
+                    progress_percent = max(0.0, min(100.0, float(candidate)))
+                    break
+                except (TypeError, ValueError):
+                    continue
+
+            checkpoint_mtime = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat()
+            resp = await self._client.job_checkpoint_state_report(
                 queue_id=queue_id,
                 lease_token=lease_token,
                 manifest_json=json.dumps(manifest),
-                checkpoint_path=checkpoint_path,
+                progress_percent=progress_percent,
+                checkpoint_relpath=rel_checkpoint,
+                checkpoint_mtime=checkpoint_mtime,
                 kind="latest",
             )
             if resp.get("stale"):
@@ -370,9 +376,9 @@ class JobExecutor:
 
             checkpoint_state["last_upload_sig"] = signature
             checkpoint_state["last_upload_ts"] = time.time()
-            log.info(f"[job {queue_id}] Uploaded latest checkpoint: {rel_checkpoint}")
+            log.info(f"[job {queue_id}] Reported checkpoint metadata: {rel_checkpoint}")
         except Exception as e:
-            log.warning(f"[job {queue_id}] Checkpoint upload failed: {e}")
+            log.warning(f"[job {queue_id}] Checkpoint metadata report failed: {e}")
 
     async def _terminate_process(self, proc: asyncio.subprocess.Process, queue_id: int, reason: str) -> None:
         """Best-effort subprocess termination with kill fallback."""

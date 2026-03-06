@@ -48,6 +48,7 @@ lab_url: "https://your-lab-server:8000"
 server_name: "gpu-east-1"
 api_key: "rs_1_..."          # From step 1
 max_concurrent: 1
+checkpoint_store_root: "~/.agent-lab-runner/checkpoints"
 ```
 
 ### 3. Run
@@ -95,12 +96,23 @@ Runner                              Lab API
   |                                    |
   |-- POST /jobs/{id}/progress ------->|  (every 20s, extends lease)
   |                                    |
+  |-- POST /jobs/{id}/checkpoint/state>|  (report checkpoint metadata only)
   |-- POST /jobs/{id}/complete ------->|  (upload results.json + output.txt)
 ```
 
 **Lease model:** Each claimed job has a 90-second lease. The runner extends the
 lease with each `/progress` call. If the runner crashes and the lease expires,
 the lab's dispatch worker automatically requeues the job for retry.
+
+## Checkpoint Model (Local-Only)
+
+Checkpoint files remain on the runner host. The lab stores only checkpoint
+metadata (progress percent, manifest, and server identity) for scheduling and UI.
+
+- Local checkpoint root: `~/.agent-lab-runner/checkpoints` (configurable)
+- Mapping: `exp_<experiment_id>/lineage_<lineage_id>/...`
+- Resume: a requeued job is preferentially claimed by the server with the
+  highest reported checkpoint progress.
 
 ## Crash Recovery
 

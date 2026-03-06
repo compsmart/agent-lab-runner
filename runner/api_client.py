@@ -295,6 +295,35 @@ class RemoteAPIClient:
         resp.raise_for_status()
         return resp.json()
 
+    async def job_checkpoint_state_report(
+        self,
+        queue_id: int,
+        lease_token: str,
+        manifest_json: str,
+        progress_percent: Optional[float] = None,
+        checkpoint_relpath: Optional[str] = None,
+        checkpoint_mtime: Optional[str] = None,
+        kind: str = "latest",
+    ) -> dict:
+        data = {
+            "lease_token": lease_token,
+            "manifest_json": manifest_json,
+            "kind": kind,
+            "checkpoint_relpath": checkpoint_relpath or "",
+            "checkpoint_mtime": checkpoint_mtime or "",
+        }
+        if progress_percent is not None:
+            data["progress_percent"] = str(progress_percent)
+        resp = await self._request(
+            "POST", f"/jobs/{queue_id}/checkpoint/state",
+            data=data,
+        )
+        if resp.status_code == 409:
+            log.warning(f"Checkpoint state for job {queue_id}: stale lease — {resp.text}")
+            return {"stale": True}
+        resp.raise_for_status()
+        return resp.json()
+
     async def download_checkpoint(
         self,
         queue_id: int,

@@ -1,7 +1,7 @@
 """Local SQLite state store for crash recovery.
 
-Persists active job state so the runner can resume uploads and
-status reporting after a restart.
+Persists active job state so the runner can resume result reporting
+after a restart.
 
 Schema:
     jobs(queue_id, lease_token, attempt, work_dir, status, started_at, updated_at)
