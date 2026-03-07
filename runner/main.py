@@ -24,12 +24,12 @@ Config file (YAML):
 """
 import argparse
 import asyncio
-import fcntl
 import logging
 import os
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Optional
 
@@ -65,8 +65,9 @@ def _handle_signal(signum, frame):
     _shutdown = True
 
 
-signal.signal(signal.SIGTERM, _handle_signal)
 signal.signal(signal.SIGINT, _handle_signal)
+if hasattr(signal, "SIGTERM"):
+    signal.signal(signal.SIGTERM, _handle_signal)
 
 
 def load_config(path: str) -> dict:
@@ -101,11 +102,16 @@ def _acquire_instance_lock(server_name: str) -> None:
     """Ensure only one runner instance is active per server_name on this host."""
     global _instance_lock_fd
     safe_name = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in server_name)
-    lock_path = f"/tmp/agent-lab-runner-{safe_name}.lock"
+    lock_path = os.path.join(tempfile.gettempdir(), f"agent-lab-runner-{safe_name}.lock")
     fd = open(lock_path, "w")
     try:
-        fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
+        if sys.platform == "win32":
+            import msvcrt
+            msvcrt.locking(fd.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError):
         fd.close()
         raise RuntimeError(
             f"Another runner instance is already running for server_name={server_name}"
@@ -395,7 +401,11 @@ async def main(config_path: str):
                             )
                             if result.get("changed"):
                                 log.info("Runner code changed after update; restarting process")
-                                os.execv(sys.executable, [sys.executable] + sys.argv)
+                                if sys.platform == "win32":
+                                    subprocess.Popen([sys.executable] + sys.argv)
+                                    sys.exit(0)
+                                else:
+                                    os.execv(sys.executable, [sys.executable] + sys.argv)
                         else:
                             log.info("Runner update request was already handled by another process")
                     except Exception as e:

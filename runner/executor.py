@@ -515,13 +515,22 @@ class JobExecutor:
 
         log.info(f"[job {queue_id}] Running benchmark command: {command} in {cwd}")
         with open(output_path, "w") as out_f:
-            proc = await asyncio.create_subprocess_exec(
-                "/bin/sh", "-lc", command,
-                cwd=cwd,
-                env=env,
-                stdout=out_f,
-                stderr=asyncio.subprocess.STDOUT,
-            )
+            if sys.platform == "win32":
+                proc = await asyncio.create_subprocess_shell(
+                    command,
+                    cwd=cwd,
+                    env=env,
+                    stdout=out_f,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
+            else:
+                proc = await asyncio.create_subprocess_exec(
+                    "/bin/sh", "-lc", command,
+                    cwd=cwd,
+                    env=env,
+                    stdout=out_f,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
 
         start_time = time.time()
         last_heartbeat = start_time

@@ -8,6 +8,7 @@ Handles:
 """
 import asyncio
 import logging
+import os
 import secrets
 import time
 from typing import Any, Optional
@@ -53,6 +54,7 @@ class RemoteAPIClient:
         method: str,
         path: str,
         idempotency_key: Optional[str] = None,
+        max_retries: Optional[int] = None,
         **kwargs,
     ) -> httpx.Response:
         url = self._url(path)
@@ -60,16 +62,17 @@ class RemoteAPIClient:
         if idempotency_key:
             headers["Idempotency-Key"] = idempotency_key
 
+        retries = max_retries if max_retries is not None else MAX_RETRIES
         backoff = INITIAL_BACKOFF_S
         last_exc = None
 
-        for attempt in range(1, MAX_RETRIES + 1):
+        for attempt in range(1, retries + 1):
             try:
                 resp = await self._client.request(method, url, headers=headers, **kwargs)
-                if resp.status_code in RETRYABLE_STATUS_CODES and attempt < MAX_RETRIES:
+                if resp.status_code in RETRYABLE_STATUS_CODES and attempt < retries:
                     log.warning(
                         f"{method} {path} returned {resp.status_code} "
-                        f"(attempt {attempt}/{MAX_RETRIES}), retrying in {backoff:.1f}s"
+                        f"(attempt {attempt}/{retries}), retrying in {backoff:.1f}s"
                     )
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2, MAX_BACKOFF_S)
@@ -77,10 +80,10 @@ class RemoteAPIClient:
                 return resp
             except (httpx.TransportError, httpx.TimeoutException) as exc:
                 last_exc = exc
-                if attempt < MAX_RETRIES:
+                if attempt < retries:
                     log.warning(
                         f"{method} {path} network error: {exc} "
-                        f"(attempt {attempt}/{MAX_RETRIES}), retrying in {backoff:.1f}s"
+                        f"(attempt {attempt}/{retries}), retrying in {backoff:.1f}s"
                     )
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2, MAX_BACKOFF_S)
@@ -103,6 +106,7 @@ class RemoteAPIClient:
     ) -> dict:
         resp = await self._request(
             "POST", "/worker/heartbeat",
+            max_retries=1,
             json={
                 "server_name": server_name,
                 "version": version,
@@ -313,7 +317,7 @@ class RemoteAPIClient:
     ) -> dict:
         file_obj = open(checkpoint_path, "rb")
         files = [
-            ("checkpoint_file", (checkpoint_path.split("/")[-1], file_obj, "application/octet-stream")),
+            ("checkpoint_file", (os.path.basename(checkpoint_path), file_obj, "application/octet-stream")),
         ]
         data = {
             "lease_token": lease_token,
