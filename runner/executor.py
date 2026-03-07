@@ -77,9 +77,27 @@ class JobExecutor:
 
         Returns True on success, False on failure.
         """
-        if (job.get("job_type") or "experiment_run") == "agent_benchmark":
+        if self._is_agent_benchmark_job(job):
             return await self._execute_agent_benchmark(job)
         return await self._execute_experiment_job(job)
+
+    @staticmethod
+    def _is_agent_benchmark_job(job: dict) -> bool:
+        """Detect benchmark jobs from explicit type or payload shape.
+
+        Some lab versions may omit `job_type` in claim responses for benchmark
+        jobs, so fall back to checking benchmark-specific fields.
+        """
+        if (job.get("job_type") or "experiment_run") == "agent_benchmark":
+            return True
+
+        payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+        benchmark_command = job.get("benchmark_command") or payload.get("benchmark_command")
+        repo_url = job.get("repo_url") or payload.get("repo_url")
+        ref_type = job.get("ref_type") or payload.get("ref_type")
+        ref_value = job.get("ref_value") or payload.get("ref_value")
+
+        return bool(benchmark_command and repo_url and ref_type and ref_value)
 
     async def _execute_experiment_job(self, job: dict) -> bool:
         queue_id = job["queue_id"]

@@ -73,3 +73,26 @@ def test_executor_dispatches_agent_benchmark(monkeypatch):
 
     result = asyncio.run(executor.execute({"job_type": "agent_benchmark"}))
     assert result is True
+
+
+def test_executor_dispatches_agent_benchmark_without_job_type(monkeypatch):
+    executor = JobExecutor(client=object(), state_store=object())
+
+    async def _fake_agent(_job):
+        return True
+
+    async def _fake_experiment(_job):
+        return False
+
+    monkeypatch.setattr(executor, "_execute_agent_benchmark", _fake_agent)
+    monkeypatch.setattr(executor, "_execute_experiment_job", _fake_experiment)
+
+    result = asyncio.run(executor.execute({
+        "payload": {
+            "repo_url": "https://example.com/nexus-1.git",
+            "ref_type": "branch",
+            "ref_value": "main",
+            "benchmark_command": "python benchmarks/run.py",
+        },
+    }))
+    assert result is True
