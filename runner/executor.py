@@ -292,6 +292,20 @@ class JobExecutor:
             if not os.path.isdir(run_cwd):
                 raise FileNotFoundError(f"benchmark work_subdir not found: {work_subdir}")
 
+            # Auto-install requirements.txt if present in the working directory
+            req_path = os.path.join(run_cwd, "requirements.txt")
+            if os.path.isfile(req_path):
+                log.info(f"[job {queue_id}] Installing requirements from {req_path}")
+                await asyncio.to_thread(
+                    subprocess.run,
+                    [sys.executable, "-m", "pip", "install", "-r", req_path],
+                    cwd=run_cwd,
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+
             await self._client.job_start(queue_id, lease_token)
             self._store.upsert_job(
                 queue_id=queue_id,
