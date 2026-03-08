@@ -14,3 +14,7 @@ __pycache__/
 
 # Local cron output log
 runner-cron.log
+
+# Log files
+logs/
+*.log
