@@ -75,6 +75,27 @@ def _setup_file_logging(log_dir: str, max_bytes: int = 10 * 1024 * 1024, backup_
     logging.getLogger().addHandler(handler)
     log.info(f"File logging enabled: {log_path} (max {max_bytes // 1024 // 1024}MB x{backup_count} rotations)")
 
+
+def _cleanup_old_job_logs(job_log_dir: str, max_age_days: int = 7) -> None:
+    """Delete per-job log files older than max_age_days."""
+    if not os.path.isdir(job_log_dir):
+        return
+    cutoff = time.time() - max_age_days * 86400
+    removed = 0
+    for fname in os.listdir(job_log_dir):
+        if not fname.endswith(".log"):
+            continue
+        fpath = os.path.join(job_log_dir, fname)
+        try:
+            if os.path.isfile(fpath) and os.path.getmtime(fpath) < cutoff:
+                os.remove(fpath)
+                removed += 1
+        except OSError:
+            pass
+    if removed:
+        log.info(f"Cleaned up {removed} job log file(s) older than {max_age_days} days from {job_log_dir}")
+
+
 _shutdown = False
 _instance_lock_fd = None
 
@@ -346,6 +367,7 @@ async def main(config_path: str):
     job_log_dir = os.path.expanduser(cfg["job_log_dir"]) if cfg.get("job_log_dir") else os.path.join(log_dir, "jobs")
 
     _setup_file_logging(log_dir, max_bytes=log_max_bytes, backup_count=log_backup_count)
+    _cleanup_old_job_logs(job_log_dir)  # purge stale logs on startup
 
     log.info(
         f"Remote Runner starting: server={server_name} lab={lab_url} "
@@ -374,6 +396,7 @@ async def main(config_path: str):
 
         active_tasks: set[asyncio.Task] = set()
         active_queue_ids: set[int] = set()
+        last_log_cleanup = time.time()
 
         def _task_done(task: asyncio.Task):
             active_tasks.discard(task)
@@ -499,6 +522,12 @@ async def main(config_path: str):
                             active_tasks.add(task)
                     except Exception as e:
                         log.warning(f"Claim failed: {e}")
+
+                # Periodic job log cleanup (every 24 hours)
+                now = time.time()
+                if now - last_log_cleanup >= 86400:
+                    _cleanup_old_job_logs(job_log_dir)
+                    last_log_cleanup = now
 
                 # Sleep: shorter when idle, longer when busy
                 sleep_s = busy_interval if active_tasks else idle_interval
