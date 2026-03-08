@@ -25,6 +25,7 @@ Config file (YAML):
 import argparse
 import asyncio
 import logging
+import logging.handlers
 import os
 import signal
 import subprocess
@@ -54,6 +55,25 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%S",
 )
 log = logging.getLogger("runner.main")
+
+LOG_FORMAT = "%(asctime)s [%(name)s] %(levelname)s %(message)s"
+LOG_DATEFMT = "%Y-%m-%dT%H:%M:%S"
+
+
+def _setup_file_logging(log_dir: str, max_bytes: int = 10 * 1024 * 1024, backup_count: int = 7) -> None:
+    """Add a rotating file handler to the root logger so all runner.* logs go to disk."""
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, "runner.log")
+    handler = logging.handlers.RotatingFileHandler(
+        log_path,
+        maxBytes=max_bytes,
+        backupCount=backup_count,
+        encoding="utf-8",
+    )
+    handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=LOG_DATEFMT))
+    handler.setLevel(logging.DEBUG)
+    logging.getLogger().addHandler(handler)
+    log.info(f"File logging enabled: {log_path} (max {max_bytes // 1024 // 1024}MB x{backup_count} rotations)")
 
 _shutdown = False
 _instance_lock_fd = None
@@ -90,6 +110,10 @@ def load_config(path: str) -> dict:
     cfg.setdefault("checkpoint_latest_file", "latest.json")
     cfg.setdefault("checkpoint_store_root", "~/.agent-lab-runner/checkpoints")
     cfg.setdefault("runner_repo_dir", None)
+    cfg.setdefault("log_dir", os.path.expanduser("~/.agent-lab-runner/logs"))
+    cfg.setdefault("log_max_bytes", 10 * 1024 * 1024)  # 10 MB
+    cfg.setdefault("log_backup_count", 7)
+    cfg.setdefault("job_log_dir", None)  # defaults to log_dir/jobs/
 
     for required in ("lab_url", "server_name", "api_key"):
         if not cfg.get(required):
@@ -316,6 +340,12 @@ async def main(config_path: str):
     checkpoint_latest_file = cfg["checkpoint_latest_file"]
     checkpoint_store_root = os.path.expanduser(cfg["checkpoint_store_root"])
     runner_repo_dir = cfg.get("runner_repo_dir") or _runner_repo_dir()
+    log_dir = os.path.expanduser(cfg["log_dir"])
+    log_max_bytes = int(cfg["log_max_bytes"])
+    log_backup_count = int(cfg["log_backup_count"])
+    job_log_dir = os.path.expanduser(cfg["job_log_dir"]) if cfg.get("job_log_dir") else os.path.join(log_dir, "jobs")
+
+    _setup_file_logging(log_dir, max_bytes=log_max_bytes, backup_count=log_backup_count)
 
     log.info(
         f"Remote Runner starting: server={server_name} lab={lab_url} "
@@ -336,6 +366,7 @@ async def main(config_path: str):
             checkpoint_dir_name=checkpoint_dir_name,
             checkpoint_latest_file=checkpoint_latest_file,
             checkpoint_store_root=checkpoint_store_root,
+            job_log_dir=job_log_dir,
         )
 
         # Crash recovery on startup

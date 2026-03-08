@@ -2,6 +2,7 @@
 import asyncio
 import json
 import logging
+import logging.handlers
 import os
 import shutil
 import subprocess
@@ -47,6 +48,10 @@ def _resolve_python_interpreter() -> str:
     raise FileNotFoundError("No Python interpreter found (tried sys.executable, python3, python)")
 
 
+_JOB_LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
+_JOB_LOG_DATEFMT = "%Y-%m-%dT%H:%M:%S"
+
+
 class JobExecutor:
     def __init__(
         self,
@@ -59,6 +64,7 @@ class JobExecutor:
         checkpoint_dir_name: str = DEFAULT_CHECKPOINT_DIR_NAME,
         checkpoint_latest_file: str = DEFAULT_CHECKPOINT_LATEST_FILE,
         checkpoint_store_root: Optional[str] = None,
+        job_log_dir: Optional[str] = None,
     ):
         self._client = client
         self._store = state_store
@@ -71,6 +77,36 @@ class JobExecutor:
         self._checkpoint_store_root = os.path.expanduser(
             checkpoint_store_root or "~/.agent-lab-runner/checkpoints"
         )
+        self._job_log_dir = os.path.expanduser(
+            job_log_dir or "~/.agent-lab-runner/logs/jobs"
+        )
+
+    def _open_job_log(self, queue_id: int, job_type: str) -> tuple[logging.Logger, logging.FileHandler]:
+        """Create a per-job FileHandler and attach it to the runner.executor logger.
+
+        Returns (job_logger, handler) — caller must call _close_job_log() when done.
+        """
+        os.makedirs(self._job_log_dir, exist_ok=True)
+        ts = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
+        log_path = os.path.join(self._job_log_dir, f"job-{queue_id}-{job_type}-{ts}.log")
+        handler = logging.FileHandler(log_path, encoding="utf-8")
+        handler.setFormatter(logging.Formatter(_JOB_LOG_FORMAT, datefmt=_JOB_LOG_DATEFMT))
+        handler.setLevel(logging.DEBUG)
+        # Attach to the executor logger so all its messages go to this file too
+        logging.getLogger("runner.executor").addHandler(handler)
+        logging.getLogger("runner.api_client").addHandler(handler)
+        job_logger = logging.getLogger(f"runner.job.{queue_id}")
+        job_logger.addHandler(handler)
+        job_logger.info(f"Job {queue_id} ({job_type}) started — log: {log_path}")
+        return job_logger, handler
+
+    def _close_job_log(self, queue_id: int, handler: logging.FileHandler, success: bool) -> None:
+        """Detach and flush the per-job file handler."""
+        handler.flush()
+        logging.getLogger("runner.executor").removeHandler(handler)
+        logging.getLogger("runner.api_client").removeHandler(handler)
+        logging.getLogger(f"runner.job.{queue_id}").removeHandler(handler)
+        handler.close()
 
     async def execute(self, job: dict) -> bool:
         """Execute a claimed job end-to-end.
@@ -100,6 +136,14 @@ class JobExecutor:
         return bool(benchmark_command and repo_url and ref_type and ref_value)
 
     async def _execute_experiment_job(self, job: dict) -> bool:
+        queue_id = job["queue_id"]
+        _job_logger, _job_handler = self._open_job_log(queue_id, "experiment")
+        try:
+            return await self._execute_experiment_job_inner(job, _job_logger)
+        finally:
+            self._close_job_log(queue_id, _job_handler, success=True)
+
+    async def _execute_experiment_job_inner(self, job: dict, _job_logger: logging.Logger) -> bool:
         queue_id = job["queue_id"]
         lease_token = job["lease_token"]
         code_path = job.get("code_path")
@@ -250,6 +294,14 @@ class JobExecutor:
                 cleanup_work_dir(work_dir)
 
     async def _execute_agent_benchmark(self, job: dict) -> bool:
+        queue_id = job["queue_id"]
+        _job_logger, _job_handler = self._open_job_log(queue_id, "benchmark")
+        try:
+            return await self._execute_agent_benchmark_inner(job, _job_logger)
+        finally:
+            self._close_job_log(queue_id, _job_handler, success=True)
+
+    async def _execute_agent_benchmark_inner(self, job: dict, _job_logger: logging.Logger) -> bool:
         queue_id = job["queue_id"]
         lease_token = job["lease_token"]
         payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
@@ -445,7 +497,9 @@ class JobExecutor:
 
         log.info(f"[job {queue_id}] Running: {python_exec} {run_py} in {cwd}")
 
-        with open(output_path, "w") as out_f:
+        # Open output file and keep it open for the duration of the subprocess
+        out_f = open(output_path, "w")
+        try:
             proc = await asyncio.create_subprocess_exec(
                 python_exec, run_py,
                 cwd=cwd,
@@ -454,59 +508,62 @@ class JobExecutor:
                 stderr=asyncio.subprocess.STDOUT,
             )
 
-        start_time = time.time()
-        last_heartbeat = start_time
-        last_checkpoint_sync = start_time
+            start_time = time.time()
+            last_heartbeat = start_time
+            last_checkpoint_sync = start_time
 
-        try:
-            while True:
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=1.0)
-                    break
-                except asyncio.TimeoutError:
-                    pass
-
-                now = time.time()
-                if now - last_heartbeat >= PROGRESS_INTERVAL_S:
-                    log_tail = ""
+            try:
+                while True:
                     try:
-                        with open(output_path, errors="replace") as f:
-                            content = f.read()
-                            log_tail = content[-OUTPUT_TAIL_CHARS:]
-                    except Exception:
+                        await asyncio.wait_for(proc.wait(), timeout=1.0)
+                        break
+                    except asyncio.TimeoutError:
                         pass
 
-                    elapsed = int(now - start_time)
-                    try:
-                        result = await self._client.job_progress(
-                            queue_id=queue_id,
-                            lease_token=lease_token,
-                            eta_seconds=None,
-                            metrics={"elapsed_s": elapsed},
-                            log_tail=log_tail,
-                        )
-                    except Exception:
-                        # If we can no longer report progress, stop the child process
-                        # before bubbling the error to avoid orphaned runs.
-                        await self._terminate_process(proc, queue_id, "progress update failed")
-                        raise
+                    now = time.time()
+                    if now - last_heartbeat >= PROGRESS_INTERVAL_S:
+                        log_tail = ""
+                        try:
+                            with open(output_path, errors="replace") as f:
+                                content = f.read()
+                                log_tail = content[-OUTPUT_TAIL_CHARS:]
+                        except Exception:
+                            pass
 
-                    if result.get("stale"):
-                        log.warning(f"[job {queue_id}] Stale lease detected during progress — killing process")
-                        await self._terminate_process(proc, queue_id, "stale lease")
-                        return False, -1
+                        elapsed = int(now - start_time)
+                        try:
+                            result = await self._client.job_progress(
+                                queue_id=queue_id,
+                                lease_token=lease_token,
+                                eta_seconds=None,
+                                metrics={"elapsed_s": elapsed},
+                                log_tail=log_tail,
+                            )
+                        except Exception:
+                            # If we can no longer report progress, stop the child process
+                            # before bubbling the error to avoid orphaned runs.
+                            await self._terminate_process(proc, queue_id, "progress update failed")
+                            raise
 
-                    last_heartbeat = now
+                        if result.get("stale"):
+                            log.warning(f"[job {queue_id}] Stale lease detected during progress — killing process")
+                            await self._terminate_process(proc, queue_id, "stale lease")
+                            return False, -1
 
-                if (
-                    self._checkpoint_sync_enabled
-                    and now - last_checkpoint_sync >= self._checkpoint_sync_interval_s
-                ):
-                    await self._upload_latest_checkpoint_if_changed(queue_id, lease_token, checkpoint_state)
-                    last_checkpoint_sync = now
+                        last_heartbeat = now
+
+                    if (
+                        self._checkpoint_sync_enabled
+                        and now - last_checkpoint_sync >= self._checkpoint_sync_interval_s
+                    ):
+                        await self._upload_latest_checkpoint_if_changed(queue_id, lease_token, checkpoint_state)
+                        last_checkpoint_sync = now
+            finally:
+                if proc.returncode is None:
+                    await self._terminate_process(proc, queue_id, "executor exiting")
         finally:
-            if proc.returncode is None:
-                await self._terminate_process(proc, queue_id, "executor exiting")
+            # Ensure file is closed regardless of how we exit
+            out_f.close()
 
         return_code = proc.returncode
         return (return_code == 0), return_code
@@ -528,7 +585,10 @@ class JobExecutor:
                 env[key] = str(value)
 
         log.info(f"[job {queue_id}] Running benchmark command: {command} in {cwd}")
-        with open(output_path, "w") as out_f:
+
+        # Open output file and keep it open for the duration of the subprocess
+        out_f = open(output_path, "w")
+        try:
             if sys.platform == "win32":
                 proc = await asyncio.create_subprocess_shell(
                     command,
@@ -546,43 +606,46 @@ class JobExecutor:
                     stderr=asyncio.subprocess.STDOUT,
                 )
 
-        start_time = time.time()
-        last_heartbeat = start_time
-        try:
-            while True:
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=1.0)
-                    break
-                except asyncio.TimeoutError:
-                    pass
+            start_time = time.time()
+            last_heartbeat = start_time
+            try:
+                while True:
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=1.0)
+                        break
+                    except asyncio.TimeoutError:
+                        pass
 
-                now = time.time()
-                if now - last_heartbeat < PROGRESS_INTERVAL_S:
-                    continue
+                    now = time.time()
+                    if now - last_heartbeat < PROGRESS_INTERVAL_S:
+                        continue
 
-                log_tail = ""
-                try:
-                    with open(output_path, errors="replace") as f:
-                        log_tail = f.read()[-OUTPUT_TAIL_CHARS:]
-                except Exception:
-                    pass
+                    log_tail = ""
+                    try:
+                        with open(output_path, errors="replace") as f:
+                            log_tail = f.read()[-OUTPUT_TAIL_CHARS:]
+                    except Exception:
+                        pass
 
-                elapsed = int(now - start_time)
-                result = await self._client.job_progress(
-                    queue_id=queue_id,
-                    lease_token=lease_token,
-                    eta_seconds=None,
-                    metrics={"elapsed_s": elapsed, "command": command},
-                    log_tail=log_tail,
-                )
-                if result.get("stale"):
-                    log.warning(f"[job {queue_id}] Stale lease detected during benchmark command")
-                    await self._terminate_process(proc, queue_id, "stale lease")
-                    return False, -1
-                last_heartbeat = now
+                    elapsed = int(now - start_time)
+                    result = await self._client.job_progress(
+                        queue_id=queue_id,
+                        lease_token=lease_token,
+                        eta_seconds=None,
+                        metrics={"elapsed_s": elapsed, "command": command},
+                        log_tail=log_tail,
+                    )
+                    if result.get("stale"):
+                        log.warning(f"[job {queue_id}] Stale lease detected during benchmark command")
+                        await self._terminate_process(proc, queue_id, "stale lease")
+                        return False, -1
+                    last_heartbeat = now
+            finally:
+                if proc.returncode is None:
+                    await self._terminate_process(proc, queue_id, "executor exiting")
         finally:
-            if proc.returncode is None:
-                await self._terminate_process(proc, queue_id, "executor exiting")
+            # Ensure file is closed regardless of how we exit
+            out_f.close()
 
         return_code = proc.returncode
         return (return_code == 0), return_code
