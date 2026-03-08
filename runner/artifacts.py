@@ -76,7 +76,7 @@ def collect_benchmark_artifacts(work_dir: str) -> dict[str, Optional[str]]:
     1. Tracked run directories containing run_spec.json + metrics.json
     2. Standalone metrics.json/results.json files
     """
-    newest_tracked: tuple[float, Path] | None = None
+    newest_tracked: tuple[float, str, Path] | None = None
     fallback_metrics: Path | None = None
     fallback_results: Path | None = None
     fallback_events: Path | None = None
@@ -87,8 +87,9 @@ def collect_benchmark_artifacts(work_dir: str) -> dict[str, Optional[str]]:
         if {"run_spec.json", "metrics.json"}.issubset(files):
             marker = root_path / "metrics.json"
             mtime = marker.stat().st_mtime
-            if newest_tracked is None or mtime > newest_tracked[0]:
-                newest_tracked = (mtime, root_path)
+            dir_name = root_path.name
+            if newest_tracked is None or mtime > newest_tracked[0] or (mtime == newest_tracked[0] and dir_name > newest_tracked[1]):
+                newest_tracked = (mtime, dir_name, root_path)
         if "metrics.json" in files:
             candidate = root_path / "metrics.json"
             if fallback_metrics is None or candidate.stat().st_mtime > fallback_metrics.stat().st_mtime:
@@ -107,7 +108,7 @@ def collect_benchmark_artifacts(work_dir: str) -> dict[str, Optional[str]]:
                 fallback_status = candidate
 
     if newest_tracked:
-        run_dir = newest_tracked[1]
+        run_dir = newest_tracked[2]
         return {
             "run_dir": str(run_dir),
             "run_spec_json": str(run_dir / "run_spec.json"),
