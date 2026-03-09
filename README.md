@@ -17,11 +17,13 @@ results back — all without requiring inbound connectivity to the remote machin
 git clone <repo> /opt/agent-lab-runner
 cd /opt/agent-lab-runner
 
-# Create virtual environment
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
+# Create venv and install all dependencies (runner + PyTorch CUDA 12.8)
+bash setup.sh
 ```
+
+> **Note:** `setup.sh` installs PyTorch built against CUDA 12.8 (`cu128`), which
+> matches the system CUDA 12 libraries on supported GPU servers. Re-run it after
+> any CUDA driver upgrade to keep the torch build aligned.
 
 ## Setup
 
