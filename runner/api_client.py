@@ -7,6 +7,7 @@ Handles:
 - Request timeouts
 """
 import asyncio
+import io
 import logging
 import os
 import secrets
@@ -197,6 +198,34 @@ class RemoteAPIClient:
         resp.raise_for_status()
         return resp.json()
 
+    @staticmethod
+    def _read_and_truncate(path: str, max_bytes: int) -> io.BytesIO:
+        """Read a file, truncating to max_bytes if needed."""
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            if size <= max_bytes:
+                return io.BytesIO(f.read())
+            content = f.read(max_bytes)
+            content += b"\n\n... [truncated, original size: %d bytes] ...\n" % size
+            return io.BytesIO(content)
+
+    @staticmethod
+    def _read_and_truncate_output(path: str, max_bytes: int = 512 * 1024) -> io.BytesIO:
+        """Read output.txt keeping first and last portions for context."""
+        size = os.path.getsize(path)
+        if size <= max_bytes:
+            with open(path, "rb") as f:
+                return io.BytesIO(f.read())
+
+        head_bytes = max_bytes // 5       # 20% for head
+        tail_bytes = max_bytes * 4 // 5   # 80% for tail (has results)
+        with open(path, "rb") as f:
+            head = f.read(head_bytes)
+            f.seek(max(0, size - tail_bytes))
+            tail = f.read()
+        sep = (b"\n\n... [%d bytes truncated] ...\n\n" % (size - len(head) - len(tail)))
+        return io.BytesIO(head + sep + tail)
+
     async def job_complete(
         self,
         queue_id: int,
@@ -210,9 +239,11 @@ class RemoteAPIClient:
         data = {"lease_token": lease_token, "summary": summary}
 
         if results_json_path:
-            files.append(("results_json", ("results.json", open(results_json_path, "rb"), "application/json")))
+            results_content = self._read_and_truncate(results_json_path, max_bytes=2 * 1024 * 1024)
+            files.append(("results_json", ("results.json", results_content, "application/json")))
         if output_txt_path:
-            files.append(("output_txt", ("output.txt", open(output_txt_path, "rb"), "text/plain")))
+            output_content = self._read_and_truncate_output(output_txt_path, max_bytes=512 * 1024)
+            files.append(("output_txt", ("output.txt", output_content, "text/plain")))
 
         # Use multipart if files present, otherwise plain form data
         if files:
