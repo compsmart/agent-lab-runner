@@ -205,6 +205,21 @@ class JobExecutor:
                 raise FileNotFoundError(f"run.py not found in tarball (code_path={code_path})")
             log.info(f"[job {queue_id}] Found run.py: {run_py}")
 
+            # 3b. Auto-install requirements.txt if present in the experiment directory
+            req_path = os.path.join(os.path.dirname(run_py), "requirements.txt")
+            if os.path.isfile(req_path):
+                log.info(f"[job {queue_id}] Installing requirements from {req_path}")
+                await asyncio.to_thread(
+                    subprocess.run,
+                    [sys.executable, "-m", "pip", "install", "-r", req_path],
+                    cwd=os.path.dirname(run_py),
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                log.info(f"[job {queue_id}] Requirements installed successfully")
+
             checkpoint_dir, latest_path = await self._prepare_resume_checkpoint(
                 queue_id=queue_id,
                 experiment_id=experiment_id,
