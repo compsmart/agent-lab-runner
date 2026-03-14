@@ -209,17 +209,19 @@ class JobExecutor:
             req_path = os.path.join(os.path.dirname(run_py), "requirements.txt")
             if os.path.isfile(req_path):
                 log.info(f"[job {queue_id}] Installing requirements from {req_path}")
-                await asyncio.to_thread(
+                pip_result = await asyncio.to_thread(
                     subprocess.run,
                     [sys.executable, "-m", "pip", "install",
                      "--extra-index-url", "https://download.pytorch.org/whl/cu121",
                      "-r", req_path],
                     cwd=os.path.dirname(run_py),
-                    check=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                    capture_output=True,
                     text=True,
                 )
+                if pip_result.returncode != 0:
+                    pip_error = (pip_result.stderr or pip_result.stdout or "").strip()
+                    log.error(f"[job {queue_id}] pip install failed:\n{pip_error}")
+                    raise RuntimeError(f"pip install failed (exit {pip_result.returncode}): {pip_error[-500:]}")
                 log.info(f"[job {queue_id}] Requirements installed successfully")
 
             checkpoint_dir, latest_path = await self._prepare_resume_checkpoint(
@@ -270,23 +272,33 @@ class JobExecutor:
                 log.info(f"[job {queue_id}] Completed successfully")
                 return True
             else:
-                # Read tail for error report
+                # Read tail for error report — prefer the known output_path
                 log_tail = ""
-                if artifacts["output_txt"] and os.path.exists(artifacts["output_txt"]):
-                    with open(artifacts["output_txt"], errors="replace") as f:
-                        content = f.read()
-                        log_tail = content[-OUTPUT_TAIL_CHARS:]
+                fail_output = output_path if os.path.exists(output_path) else (
+                    artifacts["output_txt"] if artifacts["output_txt"] and os.path.exists(artifacts["output_txt"]) else None
+                )
+                if fail_output:
+                    try:
+                        with open(fail_output, errors="replace") as f:
+                            content = f.read()
+                            log_tail = content[-OUTPUT_TAIL_CHARS:]
+                    except Exception:
+                        pass
+
+                fail_message = f"run.py exited with return_code={return_code}"
+                if not log_tail:
+                    fail_message += " (no output captured — experiment may have crashed before producing output)"
 
                 await self._client.job_fail(
                     queue_id=queue_id,
                     lease_token=lease_token,
                     error_code="NONZERO_EXIT",
-                    message=f"run.py exited with return_code={return_code}",
+                    message=fail_message,
                     retryable=False,  # code error — likely not transient
                     log_tail=log_tail,
                 )
                 self._store.mark_done(queue_id)
-                log.warning(f"[job {queue_id}] Failed with return_code={return_code}")
+                log.warning(f"[job {queue_id}] {fail_message}")
                 if log_tail:
                     log.warning(f"[job {queue_id}] Output tail:\n{log_tail}")
                 return False
@@ -367,17 +379,19 @@ class JobExecutor:
             req_path = os.path.join(run_cwd, "requirements.txt")
             if os.path.isfile(req_path):
                 log.info(f"[job {queue_id}] Installing requirements from {req_path}")
-                await asyncio.to_thread(
+                pip_result = await asyncio.to_thread(
                     subprocess.run,
                     [sys.executable, "-m", "pip", "install",
                      "--extra-index-url", "https://download.pytorch.org/whl/cu121",
                      "-r", req_path],
                     cwd=run_cwd,
-                    check=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                    capture_output=True,
                     text=True,
                 )
+                if pip_result.returncode != 0:
+                    pip_error = (pip_result.stderr or pip_result.stdout or "").strip()
+                    log.error(f"[job {queue_id}] pip install failed:\n{pip_error}")
+                    raise RuntimeError(f"pip install failed (exit {pip_result.returncode}): {pip_error[-500:]}")
 
             await self._client.job_start(queue_id, lease_token)
             self._store.upsert_job(
@@ -432,18 +446,28 @@ class JobExecutor:
 
             log_tail = ""
             if os.path.exists(output_path):
-                with open(output_path, errors="replace") as f:
-                    log_tail = f.read()[-OUTPUT_TAIL_CHARS:]
+                try:
+                    with open(output_path, errors="replace") as f:
+                        log_tail = f.read()[-OUTPUT_TAIL_CHARS:]
+                except Exception:
+                    pass
+
+            fail_message = f"benchmark command exited with return_code={return_code}"
+            if not log_tail:
+                fail_message += " (no output captured — command may have crashed before producing output)"
+
             await self._client.job_fail(
                 queue_id=queue_id,
                 lease_token=lease_token,
                 error_code="NONZERO_EXIT",
-                message=f"benchmark command exited with return_code={return_code}",
+                message=fail_message,
                 retryable=False,
                 log_tail=log_tail,
             )
             self._store.mark_done(queue_id)
-            log.warning(f"[job {queue_id}] Agent benchmark failed with return_code={return_code}")
+            log.warning(f"[job {queue_id}] {fail_message}")
+            if log_tail:
+                log.warning(f"[job {queue_id}] Output tail:\n{log_tail}")
             return False
 
         except FileNotFoundError as e:
@@ -801,6 +825,7 @@ class JobExecutor:
         error_code: str,
         message: str,
         retryable: bool,
+        log_tail: str = "",
     ):
         try:
             await self._client.job_fail(
@@ -809,6 +834,7 @@ class JobExecutor:
                 error_code=error_code,
                 message=message,
                 retryable=retryable,
+                log_tail=log_tail,
             )
             self._store.mark_done(queue_id)
         except Exception as e:
