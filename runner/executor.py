@@ -211,7 +211,9 @@ class JobExecutor:
                 log.info(f"[job {queue_id}] Installing requirements from {req_path}")
                 await asyncio.to_thread(
                     subprocess.run,
-                    [sys.executable, "-m", "pip", "install", "-r", req_path],
+                    [sys.executable, "-m", "pip", "install",
+                     "--extra-index-url", "https://download.pytorch.org/whl/cu121",
+                     "-r", req_path],
                     cwd=os.path.dirname(run_py),
                     check=True,
                     stdout=subprocess.PIPE,
@@ -285,6 +287,8 @@ class JobExecutor:
                 )
                 self._store.mark_done(queue_id)
                 log.warning(f"[job {queue_id}] Failed with return_code={return_code}")
+                if log_tail:
+                    log.warning(f"[job {queue_id}] Output tail:\n{log_tail}")
                 return False
 
         except FileNotFoundError as e:
@@ -365,7 +369,9 @@ class JobExecutor:
                 log.info(f"[job {queue_id}] Installing requirements from {req_path}")
                 await asyncio.to_thread(
                     subprocess.run,
-                    [sys.executable, "-m", "pip", "install", "-r", req_path],
+                    [sys.executable, "-m", "pip", "install",
+                     "--extra-index-url", "https://download.pytorch.org/whl/cu121",
+                     "-r", req_path],
                     cwd=run_cwd,
                     check=True,
                     stdout=subprocess.PIPE,
