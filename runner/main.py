@@ -119,6 +119,8 @@ def load_config(path: str) -> dict:
     cfg.setdefault("lab_url", os.environ.get("LAB_URL", ""))
     cfg.setdefault("server_name", os.environ.get("SERVER_NAME", ""))
     cfg.setdefault("api_key", os.environ.get("API_KEY", ""))
+    cfg.setdefault("hf_token", os.environ.get("HF_TOKEN", ""))
+    cfg.setdefault("gemini_api_key", os.environ.get("GEMINI_API_KEY", ""))
     cfg.setdefault("max_concurrent", int(os.environ.get("MAX_CONCURRENT", "1")))
     cfg.setdefault("poll_interval_idle_s", 8)
     cfg.setdefault("poll_interval_busy_s", 20)
@@ -365,6 +367,8 @@ async def main(config_path: str):
     log_max_bytes = int(cfg["log_max_bytes"])
     log_backup_count = int(cfg["log_backup_count"])
     job_log_dir = os.path.expanduser(cfg["job_log_dir"]) if cfg.get("job_log_dir") else os.path.join(log_dir, "jobs")
+    hf_token = cfg.get("hf_token") or None
+    gemini_api_key = cfg.get("gemini_api_key") or None
 
     _setup_file_logging(log_dir, max_bytes=log_max_bytes, backup_count=log_backup_count)
     _cleanup_old_job_logs(job_log_dir)  # purge stale logs on startup
@@ -389,6 +393,8 @@ async def main(config_path: str):
             checkpoint_latest_file=checkpoint_latest_file,
             checkpoint_store_root=checkpoint_store_root,
             job_log_dir=job_log_dir,
+            hf_token=hf_token,
+            gemini_api_key=gemini_api_key,
         )
 
         # Crash recovery on startup

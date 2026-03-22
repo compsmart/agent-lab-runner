@@ -16,6 +16,18 @@ server_name: "gpu-east-1"
 # Env var: API_KEY
 api_key: "rs_1_..."
 
+# HuggingFace token for accessing private/gated models and datasets.
+# KEEP THIS SECRET. Never commit config.yaml to version control.
+# Injected as HF_TOKEN and HUGGING_FACE_HUB_TOKEN into every experiment subprocess.
+# Env var: HF_TOKEN
+hf_token: ""
+
+# Google Gemini API key for experiments that call the Gemini API.
+# KEEP THIS SECRET. Never commit config.yaml to version control.
+# Injected as GEMINI_API_KEY into every experiment subprocess.
+# Env var: GEMINI_API_KEY
+gemini_api_key: ""
+
 # Maximum number of experiments to run simultaneously on this machine.
 # Should match max_concurrent set in the lab UI for this server.
 # Env var: MAX_CONCURRENT

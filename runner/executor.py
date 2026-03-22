@@ -65,6 +65,8 @@ class JobExecutor:
         checkpoint_latest_file: str = DEFAULT_CHECKPOINT_LATEST_FILE,
         checkpoint_store_root: Optional[str] = None,
         job_log_dir: Optional[str] = None,
+        hf_token: Optional[str] = None,
+        gemini_api_key: Optional[str] = None,
     ):
         self._client = client
         self._store = state_store
@@ -80,6 +82,8 @@ class JobExecutor:
         self._job_log_dir = os.path.expanduser(
             job_log_dir or "~/.agent-lab-runner/logs/jobs"
         )
+        self._hf_token = hf_token
+        self._gemini_api_key = gemini_api_key
 
     def _open_job_log(self, queue_id: int, job_type: str) -> tuple[logging.Logger, logging.FileHandler]:
         """Create a per-job FileHandler and attach it to the runner.executor logger.
@@ -255,10 +259,15 @@ class JobExecutor:
                                    attempt=job.get("attempt", 1), work_dir=work_dir,
                                    status="uploading")
 
-            artifacts = collect_results(unpack_dir)
-            # Also check work_dir root
-            if not artifacts["output_txt"] and os.path.exists(output_path):
+            # Prefer the subprocess output file (work_dir/output.txt) over any
+            # output.txt that may have been committed into the tarball and
+            # extracted into unpack_dir — committed artifacts would otherwise
+            # shadow the real run output and hide actual errors.
+            if os.path.exists(output_path):
+                artifacts = collect_results(unpack_dir)
                 artifacts["output_txt"] = output_path
+            else:
+                artifacts = collect_results(unpack_dir)
 
             if success:
                 await self._client.job_complete(
@@ -531,6 +540,11 @@ class JobExecutor:
         """Run run.py, capturing output and sending periodic progress heartbeats."""
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
+        if self._hf_token:
+            env["HF_TOKEN"] = self._hf_token
+            env["HUGGING_FACE_HUB_TOKEN"] = self._hf_token
+        if self._gemini_api_key:
+            env["GEMINI_API_KEY"] = self._gemini_api_key
         python_exec = _resolve_python_interpreter()
         checkpoint_dir = checkpoint_state.get("checkpoint_dir")
         latest_path = checkpoint_state.get("latest_path")
