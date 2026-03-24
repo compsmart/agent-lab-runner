@@ -67,6 +67,7 @@ class JobExecutor:
         job_log_dir: Optional[str] = None,
         hf_token: Optional[str] = None,
         gemini_api_key: Optional[str] = None,
+        anthropic_api_key: Optional[str] = None,
     ):
         self._client = client
         self._store = state_store
@@ -84,6 +85,7 @@ class JobExecutor:
         )
         self._hf_token = hf_token
         self._gemini_api_key = gemini_api_key
+        self._anthropic_api_key = anthropic_api_key
 
     def _open_job_log(self, queue_id: int, job_type: str) -> tuple[logging.Logger, logging.FileHandler]:
         """Create a per-job FileHandler and attach it to the runner.executor logger.
@@ -545,6 +547,8 @@ class JobExecutor:
             env["HUGGING_FACE_HUB_TOKEN"] = self._hf_token
         if self._gemini_api_key:
             env["GEMINI_API_KEY"] = self._gemini_api_key
+        if self._anthropic_api_key:
+            env["ANTHROPIC_API_KEY"] = self._anthropic_api_key
         python_exec = _resolve_python_interpreter()
         checkpoint_dir = checkpoint_state.get("checkpoint_dir")
         latest_path = checkpoint_state.get("latest_path")
